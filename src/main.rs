@@ -1,5 +1,6 @@
 use std::env;
 use std::process::{Command, Stdio};
+use std::collections::HashSet;
 use swayipc::{Connection, Event, EventType, Fallible, WorkspaceChange, OutputChange};
 use serde_json::Value;
 
@@ -64,6 +65,7 @@ fn launch_wl_mirror(args: &[String]) -> Fallible<()> {
         .map_err(|e| e.into())
 }
 
+
 fn main() -> Fallible<()> {
     let args: Vec<String> = env::args().collect();
 
@@ -72,7 +74,7 @@ fn main() -> Fallible<()> {
         .cloned()
         .unwrap_or_else(|| DEFAULT_MIRROR_WS.to_string());
 
-    // Everything after the `--` will be passed to wl-mirror
+    // Everything after `--` goes to wl-mirror
     let mirror_args: Vec<String> = if let Some(idx) = args.iter().position(|x| x == "--") {
         args[(idx + 1)..].to_vec()
     } else {
@@ -86,13 +88,13 @@ fn main() -> Fallible<()> {
 
     let mut connection = Connection::new()?;
     let mut history = WorkspaceHistory::new();
+    let mut mirrored_outputs: HashSet<String> = HashSet::new();
 
-    // Subscribe to both workspace and output events
     let subs = [EventType::Workspace, EventType::Output];
 
     for event in Connection::new()?.subscribe(subs)? {
         match event? {
-            // Handle workspace focus changes
+            // Workspace focus handling (same as before)
             Event::Workspace(w) if w.change == WorkspaceChange::Focus => {
                 if !history.should_consider() {
                     continue;
@@ -129,19 +131,38 @@ fn main() -> Fallible<()> {
                 }
             }
 
-            // Handle output (screen) events
+            // New output detection
             Event::Output(raw_event) => {
-            let json = serde_json::to_value(&raw_event).unwrap_or_default();
+                let json = serde_json::to_value(&raw_event).unwrap_or_default();
+                if let Some(change) = json.get("change").and_then(|c| c.as_str()) {
+                    // Extract name if available
+                    let name = json
+                        .get("output")
+                        .and_then(|o| o.get("name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("<unknown>")
+                        .to_string();
 
-            if let Some(change) = json.get("change").and_then(|c| c.as_str()) {
-                if change == "added" {
-                    println!("[INFO] New output detected: {:?}", json);
-                    if let Err(e) = launch_wl_mirror(&mirror_args) {
-                        eprintln!("[ERROR] Failed to start wl-mirror: {}", e);
+                    match change {
+                        "added" => {
+                            if mirrored_outputs.insert(name.clone()) {
+                                println!("[INFO] New output added: {name}");
+                                if let Err(e) = launch_wl_mirror(&mirror_args) {
+                                    eprintln!("[ERROR] Failed to start wl-mirror: {}", e);
+                                }
+                            } else {
+                                println!("[DEBUG] Ignoring duplicate added event for {name}");
+                            }
+                        }
+                        "removed" => {
+                            if mirrored_outputs.remove(&name) {
+                                println!("[INFO] Output removed: {name}");
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
-        }
 
             _ => {}
         }
