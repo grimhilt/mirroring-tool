@@ -1,7 +1,7 @@
 use std::env;
 use std::process::{Command, Stdio};
 use std::collections::HashSet;
-use swayipc::{Connection, Event, EventType, Fallible, WorkspaceChange, OutputChange};
+use swayipc::{Connection, Event, EventType, Fallible, WorkspaceChange, OutputChange, OutputEvent};
 use serde_json::Value;
 
 const DEFAULT_MIRROR_WS: &str = "5";
@@ -53,17 +53,19 @@ impl WorkspaceHistory {
     }
 }
 
-/// Launch wl-mirror when a new output is detected.
-fn launch_wl_mirror(args: &[String]) -> Fallible<()> {
-    println!("[INFO] Launching wl-mirror with args: {:?}", args);
-    let mut cmd = Command::new("wl-mirror");
-    cmd.args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+fn launch_wl_mirror(output_name: String, args: &[String]) -> Fallible<()> {
+    println!("[INFO] Launching wl-mirror on '{}' with args: {:?}", output_name, args);
+
+    let mut cmd = std::process::Command::new("wl-mirror");
+    cmd.arg(&output_name)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map(|_| ())
         .map_err(|e| e.into())
 }
+
 
 
 fn main() -> Fallible<()> {
@@ -81,6 +83,8 @@ fn main() -> Fallible<()> {
         Vec::new()
     };
 
+    let mut activate = false;
+
     println!("[INFO] Using mirror workspace {}", mirror_ws);
     if !mirror_args.is_empty() {
         println!("[INFO] wl-mirror will be launched with: {:?}", mirror_args);
@@ -96,6 +100,21 @@ fn main() -> Fallible<()> {
         match event? {
             // Workspace focus handling (same as before)
             Event::Workspace(w) if w.change == WorkspaceChange::Focus => {
+                if !activate {
+                    continue
+                }
+
+                // Count active outputs
+                let outs = connection.get_outputs()?;
+                let active_outputs: Vec<_> = outs.iter().filter(|o| o.active).collect();
+
+                // If only one monitor, skip mirroring behavior
+                if active_outputs.len() < 2 {
+                    println!("[INFO] Only one active output detected, skipping mirror behavior.");
+                    mirrored_outputs.clear(); // reset so future plug-ins can trigger
+                    continue;
+                }
+
                 if !history.should_consider() {
                     continue;
                 }
@@ -131,36 +150,63 @@ fn main() -> Fallible<()> {
                 }
             }
 
-            // New output detection
-            Event::Output(raw_event) => {
-                let json = serde_json::to_value(&raw_event).unwrap_or_default();
-                if let Some(change) = json.get("change").and_then(|c| c.as_str()) {
-                    // Extract name if available
-                    let name = json
-                        .get("output")
-                        .and_then(|o| o.get("name"))
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("<unknown>")
-                        .to_string();
+            Event::Output(OutputEvent { change: OutputChange::Unspecified, .. }) => {
+                // Query all outputs
+                let outs = connection.get_outputs()?;
+                if outs.is_empty() {
+                    continue;
+                }
 
-                    match change {
-                        "added" => {
-                            if mirrored_outputs.insert(name.clone()) {
-                                println!("[INFO] New output added: {name}");
-                                if let Err(e) = launch_wl_mirror(&mirror_args) {
-                                    eprintln!("[ERROR] Failed to start wl-mirror: {}", e);
-                                }
-                            } else {
-                                println!("[DEBUG] Ignoring duplicate added event for {name}");
-                            }
-                        }
-                        "removed" => {
-                            if mirrored_outputs.remove(&name) {
-                                println!("[INFO] Output removed: {name}");
-                            }
-                        }
-                        _ => {}
+                // Determine primary output (focused one)
+                let primary_output = outs.iter()
+                    .find(|o| o.focused)
+                    .map(|o| o.name.clone())
+                    .unwrap_or_else(|| outs[0].name.clone());
+
+                for o in &outs {
+                    let name = &o.name;
+
+                    // Skip the primary output
+                    if name == &primary_output {
+                        continue;
                     }
+
+                    // Skip inactive outputs
+                    if !o.active {
+                        continue;
+                    }
+
+                    // Skip if already mirrored
+                    if mirrored_outputs.contains(name) {
+                        continue;
+                    }
+
+                    println!("[INFO] Detected new secondary active output: {}", name);
+                    mirrored_outputs.insert(name.clone());
+
+                    // Switch to mirror workspace
+                    if let Err(e) = move_to_workspace(&mirror_ws, &mut connection) {
+                        eprintln!("[WARN] Failed to switch to mirror workspace: {}", e);
+                    }
+
+                    // Launch wl-mirror on the secondary screen
+                    if let Err(e) = launch_wl_mirror(name.clone(), &mirror_args) {
+                        eprintln!("[ERROR] Failed to start wl-mirror for {}: {}", name, e);
+                    }
+                    // Activate after launching wl_mirror
+                    activate = true;
+
+                    let current_ws = connection.get_workspaces()?
+                        .into_iter()
+                        .find(|w| w.focused)
+                        .and_then(|w| w.name.parse::<String>().ok())
+                        .unwrap_or_else(|| "1".to_string());
+
+                    // Optional: switch back to previous workspace
+                    if let Err(e) = move_to_workspace(&current_ws, &mut connection) {
+                        eprintln!("[WARN] Failed to return to previous workspace: {}", e);
+                    }
+
                 }
             }
 
