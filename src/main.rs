@@ -1,116 +1,151 @@
-use std::collections::HashMap;
 use std::env;
-use swayipc::{Connection, Event, EventType, Fallible, WorkspaceChange};
+use std::process::{Command, Stdio};
+use swayipc::{Connection, Event, EventType, Fallible, WorkspaceChange, OutputChange};
+use serde_json::Value;
 
 const DEFAULT_MIRROR_WS: &str = "5";
 
-fn move_to_workspace(name: &String, connection: &mut Connection) -> Fallible<()> {
+fn move_to_workspace(name: &str, connection: &mut Connection) -> Fallible<()> {
     connection.run_command(format!("workspace number {}", name))?;
     Ok(())
 }
 
 struct WorkspaceHistory {
     prev: Option<String>,
-    // At true if next focus event will be trigger by switching to mirror WS
-    skip: u8,
+    skip_next: bool,
 }
 
 impl WorkspaceHistory {
     fn new() -> Self {
-        WorkspaceHistory {
-            prev: None,
-            skip: 0,
+        Self { prev: None, skip_next: false }
+    }
+
+    fn should_consider(&mut self) -> bool {
+        if self.skip_next {
+            self.skip_next = false;
+            false
+        } else {
+            true
         }
     }
 
     fn redirect_from_prev(&self, connection: &mut Connection) -> Fallible<()> {
-        move_to_workspace(&self.prev.clone().unwrap(), connection)?;
+        if let Some(prev) = &self.prev {
+            move_to_workspace(prev, connection)?;
+        }
         Ok(())
     }
 
     fn redirect_from_mirror(&mut self, connection: &mut Connection) -> Fallible<()> {
         let outputs = connection.get_outputs()?;
-        // Cancel as there is no secondary monitor
         if outputs.len() == 1 {
             return Ok(());
         }
-        let current_workspace = outputs
-            .iter()
-            .last()
-            .unwrap()
-            .current_workspace
-            .clone()
-            .unwrap();
 
-        self.skip += 1;
-        move_to_workspace(&current_workspace, connection)?;
+        if let Some(output) = outputs.iter().find(|o| !o.focused) {
+            if let Some(ws) = &output.current_workspace {
+                self.skip_next = true;
+                move_to_workspace(ws, connection)?;
+            }
+        }
         Ok(())
     }
+}
 
-    fn should_consider(&mut self) -> bool {
-        if self.skip > 0 {
-            self.skip -= 1;
-            return false;
-        }
-        return true;
-    }
+/// Launch wl-mirror when a new output is detected.
+fn launch_wl_mirror(args: &[String]) -> Fallible<()> {
+    println!("[INFO] Launching wl-mirror with args: {:?}", args);
+    let mut cmd = Command::new("wl-mirror");
+    cmd.args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.into())
 }
 
 fn main() -> Fallible<()> {
     let args: Vec<String> = env::args().collect();
-    let mirror_ws: String = if args.len() > 1 {
-        args[1].to_string()
+
+    // Extract mirror workspace number
+    let mirror_ws = args.get(1)
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_MIRROR_WS.to_string());
+
+    // Everything after the `--` will be passed to wl-mirror
+    let mirror_args: Vec<String> = if let Some(idx) = args.iter().position(|x| x == "--") {
+        args[(idx + 1)..].to_vec()
     } else {
-        DEFAULT_MIRROR_WS.to_string()
+        Vec::new()
     };
 
-    let mut connection = swayipc::Connection::new()?;
-    let ws_output: HashMap<String, String> = connection
-        .get_workspaces()?
-        .into_iter()
-        .map(|w| (w.name, w.output))
-        .collect();
+    println!("[INFO] Using mirror workspace {}", mirror_ws);
+    if !mirror_args.is_empty() {
+        println!("[INFO] wl-mirror will be launched with: {:?}", mirror_args);
+    }
 
-    let subs = [EventType::Workspace];
+    let mut connection = Connection::new()?;
     let mut history = WorkspaceHistory::new();
 
-    // Event loop
+    // Subscribe to both workspace and output events
+    let subs = [EventType::Workspace, EventType::Output];
+
     for event in Connection::new()?.subscribe(subs)? {
         match event? {
+            // Handle workspace focus changes
             Event::Workspace(w) if w.change == WorkspaceChange::Focus => {
-                // Skip events triggered by us
                 if !history.should_consider() {
                     continue;
                 }
 
-                let current = w.current.unwrap();
-                let current_name = current.name.unwrap();
+                let current = match w.current {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let current_name = current.name.unwrap_or_default();
 
                 if current_name == mirror_ws {
                     if history.prev.is_some() {
-                        // On mirror_ws from back_and_forth then redirect
-                        // to workspace before being on mirror_ws
                         history.redirect_from_prev(&mut connection)?;
                         history.prev = None;
-                    } else {
-                        // Redirect to secondary monitor
+                    } else if let Some(old) = w.old.and_then(|o| o.name) {
                         history.redirect_from_mirror(&mut connection)?;
-                        history.prev = Some(w.old.unwrap().name.unwrap());
+                        history.prev = Some(old);
                     }
-                } else if history.prev.is_some() {
-                    if ws_output.get(&current_name) == ws_output.get(&mirror_ws) {
-                        // if directly going back to a workspace on main monitor
-                        // and was previously on mirror_ws then pass through
-                        // the mirror_ws for history
-                        history.skip = 2;
+                } else if let Some(_prev) = &history.prev {
+                    let ws_output_current = connection.get_workspaces()?.into_iter()
+                        .find(|w| w.name == current_name)
+                        .map(|w| w.output);
+                    let ws_output_mirror = connection.get_workspaces()?.into_iter()
+                        .find(|w| w.name == mirror_ws)
+                        .map(|w| w.output);
+
+                    if ws_output_current == ws_output_mirror {
+                        history.skip_next = true;
                         move_to_workspace(&mirror_ws, &mut connection)?;
                         move_to_workspace(&current_name, &mut connection)?;
                         history.prev = None;
                     }
                 }
             }
-            _ => (),
+
+            // Handle output (screen) events
+            Event::Output(raw_event) => {
+            let json = serde_json::to_value(&raw_event).unwrap_or_default();
+
+            if let Some(change) = json.get("change").and_then(|c| c.as_str()) {
+                if change == "added" {
+                    println!("[INFO] New output detected: {:?}", json);
+                    if let Err(e) = launch_wl_mirror(&mirror_args) {
+                        eprintln!("[ERROR] Failed to start wl-mirror: {}", e);
+                    }
+                }
+            }
+        }
+
+            _ => {}
         }
     }
+
     Ok(())
 }
