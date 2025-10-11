@@ -11,6 +11,7 @@ fn move_to_workspace(name: &str, connection: &mut Connection) -> Fallible<()> {
     Ok(())
 }
 
+
 struct WorkspaceHistory {
     prev: Option<String>,
     skip_next: bool,
@@ -57,26 +58,24 @@ fn launch_wl_mirror(output_name: String, args: &[String]) -> Fallible<()> {
     println!("[INFO] Launching wl-mirror on '{}' with args: {:?}", output_name, args);
 
     let mut cmd = std::process::Command::new("wl-mirror");
-    cmd.arg(&output_name)
+    cmd
         .args(args)
+        .arg(&output_name)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map(|_| ())
         .map_err(|e| e.into())
+
 }
-
-
 
 fn main() -> Fallible<()> {
     let args: Vec<String> = env::args().collect();
 
-    // Extract mirror workspace number
     let mirror_ws = args.get(1)
         .cloned()
         .unwrap_or_else(|| DEFAULT_MIRROR_WS.to_string());
 
-    // Everything after `--` goes to wl-mirror
     let mirror_args: Vec<String> = if let Some(idx) = args.iter().position(|x| x == "--") {
         args[(idx + 1)..].to_vec()
     } else {
@@ -94,24 +93,65 @@ fn main() -> Fallible<()> {
     let mut history = WorkspaceHistory::new();
     let mut mirrored_outputs: HashSet<String> = HashSet::new();
 
+    // --- Initial check for secondary screen ---
+    let outs = connection.get_outputs()?;
+    let active_outputs: Vec<_> = outs.iter().filter(|o| o.active).collect();
+    if active_outputs.len() > 1 {
+        let primary_output = outs.iter()
+            .find(|o| o.focused)
+            .map(|o| o.name.clone())
+            .unwrap_or_else(|| outs[0].name.clone());
+
+        for o in &outs {
+            let name = &o.name;
+            if name == &primary_output || !o.active {
+                continue;
+            }
+
+            println!("[INFO] Secondary screen '{}' detected at startup", name);
+
+            if let Err(e) = move_to_workspace(&mirror_ws, &mut connection) {
+                eprintln!("[WARN] Failed to switch to mirror workspace: {}", e);
+            }
+
+            if let Err(e) = launch_wl_mirror(name.clone(), &mirror_args) {
+                eprintln!("[ERROR] Failed to start wl-mirror for {}: {}", name, e);
+            }
+
+
+            activate = true;
+            mirrored_outputs.insert(name.clone());
+
+            let current_ws = connection.get_workspaces()?
+                .into_iter()
+                .find(|w| w.focused)
+                .and_then(|w| w.name.parse::<String>().ok())
+                .unwrap_or_else(|| "1".to_string());
+
+            if let Err(e) = move_to_workspace(&current_ws, &mut connection) {
+                eprintln!("[WARN] Failed to return to previous workspace: {}", e);
+            }
+        }
+    } else {
+        println!("[INFO] No secondary screen detected at startup.");
+    }
+
     let subs = [EventType::Workspace, EventType::Output];
 
     for event in Connection::new()?.subscribe(subs)? {
         match event? {
-            // Workspace focus handling (same as before)
             Event::Workspace(w) if w.change == WorkspaceChange::Focus => {
                 if !activate {
-                    continue
+                    continue;
                 }
 
-                // Count active outputs
                 let outs = connection.get_outputs()?;
                 let active_outputs: Vec<_> = outs.iter().filter(|o| o.active).collect();
 
-                // If only one monitor, skip mirroring behavior
                 if active_outputs.len() < 2 {
-                    println!("[INFO] Only one active output detected, skipping mirror behavior.");
-                    mirrored_outputs.clear(); // reset so future plug-ins can trigger
+                    println!("[INFO] Only one active output detected, disabling moving behavior.");
+                    activate = false;
+                    mirrored_outputs.clear();
                     continue;
                 }
 
@@ -151,13 +191,20 @@ fn main() -> Fallible<()> {
             }
 
             Event::Output(OutputEvent { change: OutputChange::Unspecified, .. }) => {
-                // Query all outputs
                 let outs = connection.get_outputs()?;
                 if outs.is_empty() {
                     continue;
                 }
 
-                // Determine primary output (focused one)
+                let active_outputs: Vec<_> = outs.iter().filter(|o| o.active).collect();
+
+                if active_outputs.len() < 2 {
+                    println!("[INFO] No secondary screen detected, disabling moving behavior.");
+                    activate = false;
+                    mirrored_outputs.clear();
+                    continue;
+                }
+
                 let primary_output = outs.iter()
                     .find(|o| o.focused)
                     .map(|o| o.name.clone())
@@ -166,34 +213,21 @@ fn main() -> Fallible<()> {
                 for o in &outs {
                     let name = &o.name;
 
-                    // Skip the primary output
-                    if name == &primary_output {
-                        continue;
-                    }
-
-                    // Skip inactive outputs
-                    if !o.active {
-                        continue;
-                    }
-
-                    // Skip if already mirrored
-                    if mirrored_outputs.contains(name) {
+                    if name == &primary_output || !o.active || mirrored_outputs.contains(name) {
                         continue;
                     }
 
                     println!("[INFO] Detected new secondary active output: {}", name);
                     mirrored_outputs.insert(name.clone());
 
-                    // Switch to mirror workspace
                     if let Err(e) = move_to_workspace(&mirror_ws, &mut connection) {
                         eprintln!("[WARN] Failed to switch to mirror workspace: {}", e);
                     }
 
-                    // Launch wl-mirror on the secondary screen
                     if let Err(e) = launch_wl_mirror(name.clone(), &mirror_args) {
                         eprintln!("[ERROR] Failed to start wl-mirror for {}: {}", name, e);
                     }
-                    // Activate after launching wl_mirror
+
                     activate = true;
 
                     let current_ws = connection.get_workspaces()?
@@ -202,11 +236,9 @@ fn main() -> Fallible<()> {
                         .and_then(|w| w.name.parse::<String>().ok())
                         .unwrap_or_else(|| "1".to_string());
 
-                    // Optional: switch back to previous workspace
                     if let Err(e) = move_to_workspace(&current_ws, &mut connection) {
                         eprintln!("[WARN] Failed to return to previous workspace: {}", e);
                     }
-
                 }
             }
 
