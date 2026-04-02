@@ -215,6 +215,8 @@ impl MirrorManager {
         // Startup check
         self.handle_output_event()?;
 
+        // swaymsg assign [app_id="wdisplay"] 5
+
         // Event loop
         let subs = [EventType::Workspace, EventType::Output];
         for event in Connection::new()?.subscribe(subs)? {
